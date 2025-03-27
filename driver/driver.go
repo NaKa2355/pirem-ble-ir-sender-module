@@ -97,18 +97,20 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		err error
 	})
 
-	err = driver.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-		if strings.EqualFold(result.Address.String(), address) {
-			fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
-			dev, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
-			if err == nil {
-				ch <- struct {
-					dev bluetooth.Device
-					err error
-				}{dev: dev, err: err}
+	go func() {
+		err = driver.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
+			if strings.EqualFold(result.Address.String(), address) {
+				fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
+				dev, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
+				if err == nil {
+					ch <- struct {
+						dev bluetooth.Device
+						err error
+					}{dev: dev, err: err}
+				}
 			}
-		}
-	})
+		})
+	}()
 
 	if err != nil {
 		return driver, err
@@ -124,6 +126,7 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 	}
 	fmt.Println("device connected! dev: ", rawDev.dev.Address.String())
 
+	driver.wg.Add(1)
 	go func() {
 		dev := loadedDev
 		for {
