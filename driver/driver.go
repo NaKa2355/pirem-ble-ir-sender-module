@@ -13,50 +13,75 @@ import (
 
 type BLEService = map[string]bluetooth.DeviceCharacteristic
 
-func connect(ctx context.Context, adapter *bluetooth.Adapter, address string) (bluetooth.Device, error) {
-	ch := make(chan struct {
-		Dev bluetooth.Device
-		Err error
-	}, 1)
-	var device bluetooth.Device
-
-	err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-		if strings.EqualFold(result.Address.String(), address) {
-			fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
-			dev, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
-			ch <- struct {
-				Dev bluetooth.Device
-				Err error
-			}{Dev: dev, Err: err}
-		}
-	})
-	if err != nil {
-		return device, err
-	}
-	select {
-	case <-ctx.Done():
-		return device, ctx.Err()
-	case result := <-ch:
-		return result.Dev, result.Err
-	}
-}
-
 type BleIrDriver struct {
 	adapter     *bluetooth.Adapter
-	services    map[string]BLEService
-	device      bluetooth.Device
-	buffer      bytes.Buffer
 	commandChan chan IrCommand
 	wg          sync.WaitGroup
 	drop        chan struct{}
+}
+
+func (d *BleIrDriver) SendIr(irdata []int16) error {
+	resultChan := make(chan error)
+	d.commandChan <- SendIrCommand{
+		IrData: irdata,
+		Result: resultChan,
+	}
+	// read errrorCode
+	return <-resultChan
+}
+
+func (d *BleIrDriver) GetVersion() (string, error) {
+	resultChan := make(chan GetVersionCommandResult)
+	d.commandChan <- GetVersionCommand{
+		Result: resultChan,
+	}
+
+	result := <-resultChan
+	return result.Version, result.Err
+}
+
+func (d *BleIrDriver) Drop() {
+	close(d.drop)
+	d.wg.Wait()
+}
+
+type BleIrDevice struct {
+	services map[string]BLEService
+	device   bluetooth.Device
+	buffer   bytes.Buffer
+}
+
+func NewBleIrDevice(device bluetooth.Device) (BleIrDevice, error) {
+	d := BleIrDevice{
+		services: make(map[string]BLEService),
+		device:   device,
+		buffer:   bytes.Buffer{},
+	}
+	srvcs, err := d.device.DiscoverServices(nil)
+	if err != nil {
+		fmt.Printf("%s\n", err)
+		return d, err
+	}
+
+	for _, srvc := range srvcs {
+		chars, err := srvc.DiscoverCharacteristics(nil)
+		if err != nil {
+			return d, err
+		}
+		service := make(BLEService)
+		for _, char := range chars {
+			service[char.UUID().String()] = char
+		}
+		d.services[srvc.UUID().String()] = service
+	}
+
+	return d, err
 }
 
 func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDriver, error) {
 	var err error = nil
 	driver := &BleIrDriver{
 		adapter:     bluetooth.DefaultAdapter,
-		services:    make(map[string]BLEService),
-		buffer:      bytes.Buffer{},
 		commandChan: make(chan IrCommand),
 		wg:          sync.WaitGroup{},
 		drop:        make(chan struct{}),
@@ -67,49 +92,45 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		return driver, err
 	}
 
-	driver.adapter.SetConnectHandler(func(device bluetooth.Device, connected bool) {
-		driver.wg.Add(1)
-		go func() {
-			defer driver.wg.Done()
-			fmt.Println("Device Connected: ", device.Address.String())
+	ch := make(chan bluetooth.Device)
 
-			for {
-				select {
-				case <-driver.drop:
-					return
-				case command := <-driver.commandChan:
-					driver.handleCommand(command)
-				}
+	err = driver.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
+		if strings.EqualFold(result.Address.String(), address) {
+			fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
+			dev, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
+			if err == nil {
+				ch <- dev
 			}
-		}()
+		}
 	})
 
-	driver.device, err = connect(ctx, driver.adapter, address)
 	if err != nil {
 		return driver, err
 	}
 
-	srvcs, err := driver.device.DiscoverServices(nil)
+	rawDev := <-ch
+	loadedDev, err := NewBleIrDevice(rawDev)
 	if err != nil {
-		fmt.Printf("%s\n", err)
 		return driver, err
 	}
+	fmt.Println("device connected! dev: ", rawDev.Address.String())
 
-	for _, srvc := range srvcs {
-		chars, err := srvc.DiscoverCharacteristics(nil)
-		if err != nil {
-			return driver, err
+	go func() {
+		dev := loadedDev
+		for {
+			select {
+			case <-driver.drop:
+				return
+			case <-ch:
+			case command := <-driver.commandChan:
+				dev.handleCommand(command)
+			}
 		}
-		service := make(BLEService)
-		for _, char := range chars {
-			service[char.UUID().String()] = char
-		}
-		driver.services[srvc.UUID().String()] = service
-	}
+	}()
 	return driver, err
 }
 
-func (d *BleIrDriver) handleCommand(command IrCommand) {
+func (d *BleIrDevice) handleCommand(command IrCommand) {
 	command.Match(IrCommandCaces{
 		SendIr: func(command SendIrCommand) {
 			command.Result <- d.sendIr(command.IrData)
@@ -128,7 +149,7 @@ const IRDATA_CHUNK_SIZE = 20
 
 var buf = make([]byte, 512)
 
-func (d *BleIrDriver) setIrData(irData []int16) error {
+func (d *BleIrDevice) setIrData(irData []int16) error {
 	buffer := d.buffer
 	buffer.Reset()
 	if err := binary.Write(&buffer, binary.LittleEndian, irData); err != nil {
@@ -158,7 +179,7 @@ func (d *BleIrDriver) setIrData(irData []int16) error {
 	return nil
 }
 
-func (d *BleIrDriver) setIrDataSize(irData []int16) error {
+func (d *BleIrDevice) setIrDataSize(irData []int16) error {
 	buffer := d.buffer
 	buffer.Reset()
 
@@ -181,7 +202,7 @@ func (d *BleIrDriver) setIrDataSize(irData []int16) error {
 	return nil
 }
 
-func (d *BleIrDriver) readErrCode() error {
+func (d *BleIrDevice) readErrCode() error {
 	var errCode int8 = 0
 	buffer := d.buffer
 	buffer.Reset()
@@ -198,7 +219,7 @@ func (d *BleIrDriver) readErrCode() error {
 	return convertErr(errCode)
 }
 
-func (d *BleIrDriver) sendIr(irdata []int16) error {
+func (d *BleIrDevice) sendIr(irdata []int16) error {
 	if err := d.setIrData(irdata); err != nil {
 		return err
 	}
@@ -210,17 +231,7 @@ func (d *BleIrDriver) sendIr(irdata []int16) error {
 	return d.readErrCode()
 }
 
-func (d *BleIrDriver) SendIr(irdata []int16) error {
-	resultChan := make(chan error)
-	d.commandChan <- SendIrCommand{
-		IrData: irdata,
-		Result: resultChan,
-	}
-	// read errrorCode
-	return <-resultChan
-}
-
-func (d *BleIrDriver) getVersion() (string, error) {
+func (d *BleIrDevice) getVersion() (string, error) {
 	char := d.services[IrServiceUUID][FirmwareVersionUUID]
 	fmt.Printf("%v", char)
 	n, err := char.Read(buf)
@@ -228,19 +239,4 @@ func (d *BleIrDriver) getVersion() (string, error) {
 		return "", err
 	}
 	return string(buf[:n]), err
-}
-
-func (d *BleIrDriver) GetVersion() (string, error) {
-	resultChan := make(chan GetVersionCommandResult)
-	d.commandChan <- GetVersionCommand{
-		Result: resultChan,
-	}
-
-	result := <-resultChan
-	return result.Version, result.Err
-}
-
-func (d *BleIrDriver) Drop() {
-	close(d.drop)
-	d.wg.Wait()
 }
