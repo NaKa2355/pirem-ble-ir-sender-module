@@ -112,10 +112,6 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		})
 	}()
 
-	if err != nil {
-		return driver, err
-	}
-
 	rawDev := <-ch
 	if rawDev.err != nil {
 		return driver, rawDev.err
