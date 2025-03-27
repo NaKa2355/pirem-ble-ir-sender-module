@@ -19,8 +19,8 @@ func connect(ctx context.Context, adapter *bluetooth.Adapter, address string) (b
 	var device bluetooth.Device
 
 	err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-		fmt.Println("found device:", result.Address.String(), result.RSSI, result.LocalName())
 		if strings.EqualFold(result.Address.String(), address) {
+			fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
 			ch <- result
 		}
 	})

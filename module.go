@@ -3,7 +3,6 @@ package Module
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/NaKa2355/pirem-ble-ir-sender-module/driver"
 	plugin "github.com/NaKa2355/pirem/pkg/driver_module/v1"
@@ -84,9 +83,5 @@ var _ plugin.DriverModule = &Module{}
 
 func (p *Module) LoadDevice(conf json.RawMessage) (plugin.Device, error) {
 	dev, err := newDevice(conf)
-	if err != nil {
-		fmt.Printf("err: %s\n", err)
-
-	}
 	return dev, err
 }
