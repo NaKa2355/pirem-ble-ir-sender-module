@@ -51,13 +51,8 @@ func newDevice(jsonConf json.RawMessage) (dev *Device, err error) {
 		return dev, err
 	}
 
-	firmwareVersion, err := d.GetVersion()
-	if err != nil {
-		return dev, err
-	}
-
 	dev.driver = d
-	dev.info.FirmwareVersion = firmwareVersion
+	dev.info.FirmwareVersion = "0.1.0"
 	dev.info.DriverVersion = "0.1.0"
 
 	return dev, nil

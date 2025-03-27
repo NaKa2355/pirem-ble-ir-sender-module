@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"tinygo.org/x/bluetooth"
 )
@@ -47,26 +48,34 @@ func (d *BleIrDriver) Drop() {
 
 type BleIrDevice struct {
 	services map[string]BLEService
-	device   bluetooth.Device
+	device   *bluetooth.Device
 	buffer   bytes.Buffer
 }
 
-func NewBleIrDevice(device bluetooth.Device) (BleIrDevice, error) {
+func newBleIrDevice() BleIrDevice {
 	d := BleIrDevice{
 		services: make(map[string]BLEService),
-		device:   device,
+		device:   nil,
 		buffer:   bytes.Buffer{},
 	}
+	return d
+}
+
+func (d *BleIrDevice) connect(device *bluetooth.Device) {
+	d.device = device
+}
+
+func (d *BleIrDevice) scanService() error {
 	srvcs, err := d.device.DiscoverServices(nil)
 	if err != nil {
 		fmt.Printf("%s\n", err)
-		return d, err
+		return err
 	}
 
 	for _, srvc := range srvcs {
 		chars, err := srvc.DiscoverCharacteristics(nil)
 		if err != nil {
-			return d, err
+			return err
 		}
 		service := make(BLEService)
 		for _, char := range chars {
@@ -75,10 +84,40 @@ func NewBleIrDevice(device bluetooth.Device) (BleIrDevice, error) {
 		d.services[srvc.UUID().String()] = service
 	}
 
-	return d, err
+	return err
 }
 
-func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDriver, error) {
+type scanAndConnectResult struct {
+	dev BleIrDevice
+	err error
+}
+
+func scanAndConnect(adapter *bluetooth.Adapter, strAddr string) (BleIrDevice, error) {
+	dev := newBleIrDevice()
+	ch := make(chan bluetooth.ScanResult, 1)
+	err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
+		if strings.EqualFold(result.Address.String(), strAddr) {
+			fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
+			ch <- result
+			adapter.StopScan()
+		}
+	})
+
+	if err != nil {
+		return dev, err
+	}
+
+	scanResult := <-ch
+	rawDev, err := adapter.Connect(scanResult.Address, bluetooth.ConnectionParams{})
+	if err != nil {
+		return dev, err
+	}
+	dev.connect(&rawDev)
+	err = dev.scanService()
+	return dev, err
+}
+
+func NewBleIrDriverWithContext(ctx context.Context, strAddr string) (*BleIrDriver, error) {
 	var err error = nil
 	driver := &BleIrDriver{
 		adapter:     bluetooth.DefaultAdapter,
@@ -92,63 +131,60 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		return driver, err
 	}
 
-	ch := make(chan struct {
-		dev bluetooth.Device
-		err error
-	})
+	ch := make(chan scanAndConnectResult, 1)
 
 	go func() {
-		err = driver.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-			if strings.EqualFold(result.Address.String(), address) {
-				fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
-				dev, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
-				if err == nil {
-					ch <- struct {
-						dev bluetooth.Device
-						err error
-					}{dev: dev, err: err}
-				}
-			}
-		})
+		println("start scan")
+		dev, err := scanAndConnect(driver.adapter, strAddr)
+		ch <- scanAndConnectResult{dev: dev, err: err}
+		println("connected!")
 	}()
-
-	rawDev := <-ch
-	if rawDev.err != nil {
-		return driver, rawDev.err
-	}
-	loadedDev, err := NewBleIrDevice(rawDev.dev)
-	if err != nil {
-		return driver, err
-	}
-	fmt.Println("device connected! dev: ", rawDev.dev.Address.String())
 
 	driver.wg.Add(1)
 	go func() {
-		dev := loadedDev
+		defer driver.wg.Done()
+		var dev *BleIrDevice = &BleIrDevice{}
+		ticker := time.NewTicker(2 * time.Second)
+
 		for {
 			select {
+			case scanResult := <-ch:
+				if scanResult.err == nil {
+					dev = &scanResult.dev
+				}
 			case <-driver.drop:
 				return
-			case <-ch:
 			case command := <-driver.commandChan:
 				dev.handleCommand(command)
+			case <-ticker.C:
+				if dev.device == nil {
+					continue
+				}
+				rawDev, err := driver.adapter.Connect(dev.device.Address, bluetooth.ConnectionParams{})
+				if err != nil {
+					continue
+				}
+				dev.connect(&rawDev)
 			}
 		}
 	}()
 	return driver, err
 }
 
-func (d *BleIrDevice) handleCommand(command IrCommand) {
-	command.Match(IrCommandCaces{
-		SendIr: func(command SendIrCommand) {
-			command.Result <- d.sendIr(command.IrData)
+func (d *BleIrDevice) handleCommand(command IrCommand) error {
+	return command.Match(IrCommandCaces{
+		SendIr: func(command SendIrCommand) error {
+			err := d.sendIr(command.IrData)
+			command.Result <- err
+			return err
 		},
-		GetVersion: func(command GetVersionCommand) {
+		GetVersion: func(command GetVersionCommand) error {
 			version, err := d.getVersion()
 			command.Result <- GetVersionCommandResult{
 				Version: version,
 				Err:     err,
 			}
+			return err
 		},
 	})
 }
@@ -158,6 +194,9 @@ const IRDATA_CHUNK_SIZE = 20
 var buf = make([]byte, 512)
 
 func (d *BleIrDevice) setIrData(irData []int16) error {
+	if len(irData) > 600 {
+		return ErrDataTooLong
+	}
 	buffer := d.buffer
 	buffer.Reset()
 	if err := binary.Write(&buffer, binary.LittleEndian, irData); err != nil {
@@ -176,7 +215,7 @@ func (d *BleIrDevice) setIrData(irData []int16) error {
 	for i := 0; i < chunkCount; i++ {
 		startIndex := i * IRDATA_CHUNK_SIZE
 		endIndex := (i + 1) * IRDATA_CHUNK_SIZE
-		uuid := fmt.Sprintf("114b00%02d-0866-e4c2-fb93-7da2e0dfa398", i)
+		uuid := fmt.Sprintf("114b00%02x-0866-e4c2-fb93-7da2e0dfa398", i)
 		data := binaryData[startIndex:endIndex]
 		_, err := d.services[IrServiceUUID][uuid].WriteWithoutResponse(data)
 		if err != nil {
@@ -228,6 +267,9 @@ func (d *BleIrDevice) readErrCode() error {
 }
 
 func (d *BleIrDevice) sendIr(irdata []int16) error {
+	if d.device == nil {
+		return ErrNotConnected
+	}
 	if err := d.setIrData(irdata); err != nil {
 		return err
 	}
@@ -240,8 +282,10 @@ func (d *BleIrDevice) sendIr(irdata []int16) error {
 }
 
 func (d *BleIrDevice) getVersion() (string, error) {
+	if d.device == nil {
+		return "", ErrNotConnected
+	}
 	char := d.services[IrServiceUUID][FirmwareVersionUUID]
-	fmt.Printf("%v", char)
 	n, err := char.Read(buf)
 	if err != nil {
 		return "", err
