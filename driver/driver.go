@@ -47,7 +47,7 @@ type BleIrDriver struct {
 
 func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDriver, error) {
 	var err error = nil
-	driver := BleIrDriver{
+	driver := &BleIrDriver{
 		adapter:     bluetooth.DefaultAdapter,
 		services:    make(map[string]BLEService),
 		buffer:      bytes.Buffer{},
@@ -58,7 +58,7 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 
 	driver.adapter.Enable()
 	if err != nil {
-		return &driver, err
+		return driver, err
 	}
 
 	reConnectChan := make(chan struct{})
@@ -101,19 +101,19 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 
 	driver.device, err = connect(ctx, driver.adapter, address)
 	if err != nil {
-		return &driver, err
+		return driver, err
 	}
 
 	srvcs, err := driver.device.DiscoverServices(nil)
 	if err != nil {
 		fmt.Printf("%s\n", err)
-		return &driver, err
+		return driver, err
 	}
 
 	for _, srvc := range srvcs {
 		chars, err := srvc.DiscoverCharacteristics(nil)
 		if err != nil {
-			return &driver, err
+			return driver, err
 		}
 		service := make(BLEService)
 		for _, char := range chars {
@@ -121,7 +121,7 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		}
 		driver.services[srvc.UUID().String()] = service
 	}
-	return &driver, err
+	return driver, err
 }
 
 func (d *BleIrDriver) handleCommand(command IrCommand) {
