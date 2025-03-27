@@ -31,7 +31,7 @@ func convertErr(err error) error {
 }
 
 type Device struct {
-	driver driver.BleIrDriver
+	driver *driver.BleIrDriver
 	info   plugin.DeviceInfo
 }
 
@@ -68,6 +68,7 @@ func (dev *Device) GetInfo(ctx context.Context) (*plugin.DeviceInfo, error) {
 }
 
 func (dev *Device) Drop() error {
+	dev.driver.Drop()
 	return nil
 }
 
