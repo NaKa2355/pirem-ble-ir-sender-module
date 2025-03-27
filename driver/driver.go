@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"tinygo.org/x/bluetooth"
 )
@@ -15,14 +14,20 @@ import (
 type BLEService = map[string]bluetooth.DeviceCharacteristic
 
 func connect(ctx context.Context, adapter *bluetooth.Adapter, address string) (bluetooth.Device, error) {
-	ch := make(chan bluetooth.ScanResult, 1)
+	ch := make(chan struct {
+		Dev bluetooth.Device
+		Err error
+	}, 1)
 	var device bluetooth.Device
 
 	err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
 		if strings.EqualFold(result.Address.String(), address) {
 			fmt.Println("connecting to... device:", result.Address.String(), result.RSSI, result.LocalName())
-			adapter.StopScan()
-			ch <- result
+			dev, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
+			ch <- struct {
+				Dev bluetooth.Device
+				Err error
+			}{Dev: dev, Err: err}
 		}
 	})
 	if err != nil {
@@ -32,7 +37,7 @@ func connect(ctx context.Context, adapter *bluetooth.Adapter, address string) (b
 	case <-ctx.Done():
 		return device, ctx.Err()
 	case result := <-ch:
-		return adapter.Connect(result.Address, bluetooth.ConnectionParams{})
+		return result.Dev, result.Err
 	}
 }
 
@@ -62,36 +67,15 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		return driver, err
 	}
 
-	reConnectChan := make(chan struct{})
-
 	driver.adapter.SetConnectHandler(func(device bluetooth.Device, connected bool) {
 		driver.wg.Add(1)
 		go func() {
 			defer driver.wg.Done()
-			if !connected {
-				fmt.Println("Device Disconnected: ", device.Address.String())
-				timeout := bluetooth.NewDuration(time.Second)
-				reConnectChan <- struct{}{}
-				for {
-					select {
-					case <-driver.drop:
-						return
-					default:
-						_, err := driver.adapter.Connect(device.Address, bluetooth.ConnectionParams{Timeout: timeout})
-						if err == nil {
-							reConnectChan <- struct{}{}
-							return
-						}
-					}
-				}
-			}
 			fmt.Println("Device Connected: ", device.Address.String())
 
 			for {
 				select {
 				case <-driver.drop:
-					return
-				case <-reConnectChan:
 					return
 				case command := <-driver.commandChan:
 					driver.handleCommand(command)
