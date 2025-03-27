@@ -68,6 +68,7 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 		go func() {
 			defer driver.wg.Done()
 			if !connected {
+				fmt.Println("Device Disconnected: ", device.Address.String())
 				timeout := bluetooth.NewDuration(time.Second)
 				reConnectChan <- struct{}{}
 				for {
@@ -83,6 +84,8 @@ func NewBleIrDriverWithContext(ctx context.Context, address string) (*BleIrDrive
 					}
 				}
 			}
+			fmt.Println("Device Connected: ", device.Address.String())
+
 			for {
 				select {
 				case <-driver.drop:
